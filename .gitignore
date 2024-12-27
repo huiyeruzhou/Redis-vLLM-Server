@@ -1,0 +1,7 @@
+outputs
+dump.rdb
+conf
+__pycache__
+**/__pycache__
+**/*.pyc
+*.log
