@@ -4,7 +4,6 @@
 
 这个项目利用 redis 实现了客户端和服务端解耦的 llm 服务，并且在服务端进行了请求批量化以最大程度利用 vllm 的超线性加速。
 对于需要少量多次调用本地 llm，但无法在客户端批量化请求的应用来说，这将提供近似完全并行且充分批量化的推理加速。
-项目的经典用例是用于服务树搜索。
 
 ## 亮点
 
@@ -12,6 +11,8 @@
 - **超线性加速**：基于 vLLM 部署的推理引擎从任务队列中批量获取任务，通过聚合大量碎片化请求，实现超线性加速。
 - **分布式调度**：基于 Ray 实现的分布式调度器，支持多机多卡环境下灵活配置并行策略，拉起常驻 Worker 快速响应请求。
 - **优雅退出**: Redis Stream提供了删除消息的功能，客户端退出时可以主动删除消息，避免无效请求堆积。
+
+不过，由于项目使用redis流存储，所有的**请求信息**都将会一直保留在redis server机器的cpu内存中，可以使用redis-cli连接并用flushall命令在闲时删库清理（已发送的请求和未处理的返回值将全部丢失，拉起的llm不受到影响，流将会在llm下次轮询时自动重建，但您可能会看到报警日志）
 
 ## 性能试验
 
@@ -21,12 +22,45 @@
 
 可以想象，若不能有效地将请求批量化并使用合适的编程模型完成响应分发，即使使用更大规模的集群，树搜索的效率也将会大大下降。在那种情况下，请求必须手动分配给某个worker，无法进行负载均衡，且每个worker总是在处理少量的碎片请求。
 
+## 适用场景与设计理念
 
-## 整体架构
+项目尤其适用于以下场景：
+
+- **多对多生产/消费**：您正在部署多种llm，或者希望以多个客户端请求llm服务或者兼而有之。例如同时部署InferenceModel和RewardModel，并进行并发地Reward指导下的采样。
+- **碎片化请求**：您正在进行无法轻易离线批量化的请求，例如会动态产生新请求的Tree of thought推理或其他推理
+- **分布式环境**：您正在使用一个多机多卡的环境，需要创建多个llm的实例并将请求路由到这些llm上
+
+在这些场景中，以下问题将会变得十分棘手：
+
+1. 如何方便地创建并管理多个vllm model实例
+2. 如何将请求路由到这些vllm上
+3. 如何聚合碎片化的请求以实现加速
+
+如果用常规的方法进行上述操作，必须每次手动地创建vllm实例，再用一定的方式将每个实例分配给请求使用，比如要推理8000条数据，就给每1000条数据分类一个llm engine（本质上就是ddp）。而聚合碎片化请求的功能仅限于请求内部，因为跨请求的上下文是完全无法管理的。
+
+上述问题的出现，本质上是因为**请求llm响应这个过程与llm本身高度耦合**，要获得推理结果必须直接调用一个vllm.LLM或者ModelForCasualLM对象，从而限制了服务端处理请求的灵活性。
+
+于是，一个自然的想法是引入一个**消息队列**作为中间件，实现客户端与服务端的解耦。消息队列将客户端请求缓存下来，服务端可以灵活取用，不仅允许**服务端为全体客户**服务，也天然地提供了**聚合碎片化请求**。常见的中间件还实现了**多消费者模式**，我们也无需手动调度llm，让每个llm都从队列中尝试取一定批量大小消息即可。此外，创建请求过程也变得更加灵活，只要拉起若干llm实例，让他们都监听任务队列，之后随时都可以加入任务以实现请求。*至此，我们就完成了RedisWorker的设计*
+
+而对于客户端而言，原先的向llm发起请求就变成了用一个代理发起请求，代理必须完成两件事：1.将结果发送给服务器。2.获取结果并按序返回。前者只需要将消息放入任务队列即可。对于后者，由于一个请求中包含的多条prompt可能会被分拆到不同的batch中，我们可以为这一整条请求标记一个request_id，根据request_id维护一个消息队列，当服务端完成请求时，就将结果放到request_id对应的队列里。由于服务器不是严格按序返回的，我们还需要给每个prompt分配一个task_id，收集到所有结果后，将其按照传入的顺序排好队返回。*至此，我们就完成了RedisMiddleware的设计*
+
+另外，消息队列还可以帮助我们支持多种LLM共存，例如RewardModel和Inference Model同时提供服务的情况。他们可以使用不同的任务队列，这样就做到了**分别存储，互不干扰**。
+
+接下来基于上述设计选型，坦白来讲我并没有详细了解消息队列的选型比如RabiitMQ。redis作为一个内存数据库而顺带实现了stream功能而迅速进入了我的考虑，在这个场景下我们需要的就是分布式系统中的快速响应性能，并且对持久化没有强烈需求（通常是不会丢请求的），并且启动越简单越好。特别是它还为客户端的中间件提供了不同的选择：Hash/list/stream都可以充当客户端接受结果的方式，虽然实际测试下来list和stream效果都差不多，并且轮询hash也不会太差。
+
+但缺点就是stream不会自动缩容并且一旦fail了就只能从dump文件中恢复了，此外一直看到有说法说redis存大数据会比较慢，大约是10K量级说实话对于长文推理来说达到这个量级的数据还是很轻松的何况，我们需要把token序列化成json，但确实redis用起来太方便了而且感觉**创建消息队列的开销可能会比较小**因为我们每个请求都要创建一个对应的消息队列，当然这是屁股决定脑袋了（我是先决定用redis再想到用hash等存结果的），或许有更好的方法。
+
+总之完成以上选型之后项目也就正式确定，目前实现的RedisMiddleware和RedisWorker不依赖于任何具体的llm服务或者
+
+TODO：
+[ ] 现有的服务是json套json，应该改成protobuf之类的
+[ ] 请求来回现在都是str，可以再加一个codec层让我们可以指定编码协议，请求响应都用byte，这允许我们自由选择消息编码格式，毕竟对于llm而言传tokenid或许比传字符串省事很多，这需要我们平衡decode的开销和传输的开销。
+[ ] 将消息队列本身也抽象出来，只要提供port/host/queuename就可以创建一个队列，当然client相关方法要提供同步和异步两个版本，到时候可能项目就要直接改名了
+[ ] 补充更多perf，测试response长短不同时的性能并找出推荐的batchsize，防止极端case下的性能暴跌。
 
 以下是项目的时序图：
 
-![工作流程](http://plantuml.com/plantuml/svg/TLDTQzDG6BxFhtWTmjom1J_qeZ0PUEF5l76tWt7MlBIXQHBFEPdJCR1Zgr5hMvaA6qNSwA1OI17KThJ5FzDpabxv5pnTegcrzgRd9E_pyJmlMMMSKEuMJUqApsCH8OlKDP5OciODRY8yGjrWgUsrjOUfTQJRI45qpqV3XlnM2bglDMtBte45uPz9hnkqEmiQg9-ZA8siuH2BmttJGFL7M7pIqD91WMBa9Vq_g4XrdLCaHGMTliuVVK1ONWqcbnaPsNWZNftEDHYd8Ym-9SZOUkhUNtOoS2CDelPs_BmKThhooxwe78fwMpHFHhtFu52xw708JWwYbnlMjHsYwx2uomahR1hwodMAZrra_FAi4qvMzXQNO1aiRLf5YSR6Cd0p3H7x4viMa0glBBosV7anVb4BgrrH-o2_UxBKcKWfh9wZjkj0rdQLzwkxMuHdyvlCU8PxIrfCEKr-AmsZuO_WNGicEmPPRGNriXYybqVL3IiI4Sq3zMpKxwiA4ugPKcwd8PeGVaLwzP-3Id3gXtvJUGk_NYGEIRO0HPPJwQVj94lCm1qLjtmi3i-3_f7ys52WF4CElsihu5E8krIjKcIkoISLpguhPhkRXd3eXvspX2qtdorQml-MlWnYi2zwlQWC5KzudyR7pIIOZYPo_9Dj5IrTVLQ_0000)
+![工作流程](https://www.plantuml.com/plantuml/svg/XPBVJzDG5CVV-rSSYGb2fCGV-j04GyAB3wY9u1i9kQmth5b_r7jl4ILBX01MHS209k12n8naSSaM4tKZ6-6VsMst9_y5JzTAYs3Sosvxp_TxpkTxEiu5OSApJEMAo5EBGeuopwJ4LXHX29F2OweRV6HXSlB1o1Hb2vI1R1nrJah1Z-MmybPHvfn5692rBu7V2Alr0GNmvwAbaJDSOWkOC0sAVuGd9uNQEg0eKVRjBwgc2IzC2KQ9XShCquL2DE2UAUuJdX-DIqOd3Iu68bbyzLV3eFHElZcyTDI4Z_3ab2eJY95xsS4qkA62t7hVUxdShJU2RojoOqrkLsLvlzFy2YvpB5T0kByQNyxOrnQ9hiFWaa2BMKCVkyxeKuzoqJ_hH92nuk0G38EjP9fWosGi3Mwg49i_SrY1CkclIxyQl3xklThgRZRariVWfnyirwDEgDNdcUEva7CydFpgqXmHkVmiDrxGuf2IM6RDRwdGEJaDToiGxHg2pKgulIxR7uATpHaxRYBBg_YkqsfXWAb54ZDQtCRvrlVasb7OsWaEIZX7j1ODyfmA-0DReCyXIG2pO7rj18xLqU8qOAx7yzdoR6HmJX1df44KxFyLMUnpQxoZGWmbQnk1l_shlH4UrhgrCiRP_NwSXafo1R3uFDeEAJ4qMYMVjGPtLOYvkwUxyjD1IZz_ENr_rMVKSwRhkBWcOLZKyKGnkKqHeurYbOCpf5KmyUZ9msbyOHT1LTL_VQV38DihijcC5uXyql_SsokdP3ergQ1dSEFKrZtB_0q0)
 
 <!-- ```plantuml
 @startuml
@@ -39,21 +73,21 @@ box "客户端"
 end box
 
 box "Redis"
-    participant RedisStream as RedisStream
-    participant RedisHash as RedisHash
+    participant TaskStream as TaskStream
+    participant "ResultHash/Stream/List" as Result
 end box
 
 box "服务端"
     participant Server as Server
 end box
 
-Client -> RedisStream : 1. 发送请求包含多个 prompt 的请求\n(xadd '{task_id=,request_id=,data=}') * n
-RedisStream -> Server : 2. 多个worker分别批量获取消息\n(xreadgroup count ${batch_size})
+Client -> TaskStream : 1. 发送请求包含多个 prompt 的请求\n(xadd '{task_id=,request_id=,data=}') * n
+TaskStream -> Server : 2. 多个worker分别批量获取消息\n(xreadgroup count ${batch_size})
 Server -> Server : 3. 使用 vLLM 推理引擎\n批量处理任务
-Server -> RedisStream : 4. 任务完成，确认消费消息\n(xack msg_id)
-Server -> RedisHash : 5. 写入结果\n(hset request_key task_id '{result=}')
-Client -> RedisHash : 6. 轮询结果\n(hget request_key task_id) * n
-Client -> RedisStream : * 异常处理，删除消息\n(xdelete msg_id)
+Server -> Result : 4. 写入结果\n(Hash: hset request_key task_id '{result=}')\n(List: rpush request_key '{task_id=, result=}')\n(Stream: xadd request_key '{task_id=, result=}')
+Server -> TaskStream : 5. 任务完成，确认消费消息\n(xack msg_id)
+Result -> Client: 6. 结果返回\n(Hash: hget request_key task_id) * n\n(List: blpop ${timeout}) * n\n(Stream: xread block ${timeout} COUNT ${n} ...
+Client -> TaskStream : * 异常处理，删除消息\n(xdelete msg_id)
 @enduml
 ``` -->
 
