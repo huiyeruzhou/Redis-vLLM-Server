@@ -1,9 +1,12 @@
 from abc import ABC, abstractmethod
+from typing import Generic, TypeVar
 from omegaconf import DictConfig
-
+import pickle
 
 # 定义 ModelInterface 抽象基类
-class ModelInterface(ABC):
+I = TypeVar('I')
+O = TypeVar('O')
+class ModelInterface(ABC, Generic[I, O]):
     """
     ModelInterface 类是一个抽象基类，用于定义模型接口。
     它定义了一个 process 方法，用于处理输入数据并返回输出结果。
@@ -15,7 +18,7 @@ class ModelInterface(ABC):
         pass
 
     @abstractmethod
-    def process(self, batch_tasks: list) -> list:
+    def process(self, batch_tasks: list[I]) -> list[O]:
         pass
 
     def process_bytes(self, batch_tasks: list[bytes]) -> list[bytes]:
@@ -24,27 +27,17 @@ class ModelInterface(ABC):
         return self.encode_outputs(results)
 
     @staticmethod
-    def encode_outputs(value) -> list[bytes]:
-        assert isinstance(value, list), f"Expected str, got {type(value)=}, maybe you should override this method."
-        assert isinstance(value[0], str), f"Expected str, got {type(value[0])=}, maybe you should override this method."
-        return [item.encode("utf-8") for item in value]
+    def encode_outputs(value: list[O]) -> list[bytes]:
+        return [pickle.dumps(item) for item in value]
 
     @staticmethod
-    def decode_outputs(value: list[bytes]) -> list:
-        try:
-            return [item.decode("utf-8") for item in value]
-        except Exception as e:
-            raise ValueError(f"Failed to decode outputs into str: {e}, maybe you should override this method.")
+    def decode_outputs(value: list[bytes]) -> list[O]:
+        return [pickle.loads(item) for item in value]
 
     @staticmethod
-    def encode_inputs(value) -> list[bytes]:
-        assert isinstance(value, list), f"Expected str, got {type(value)=}, maybe you should override this method."
-        assert isinstance(value[0], str), f"Expected str, got {type(value[0])=}, maybe you should override this method."
-        return [item.encode("utf-8") for item in value]
-
+    def encode_inputs(value: list[I]) -> list[bytes]:
+        return [pickle.dumps(item) for item in value]
+    
     @staticmethod
-    def decode_inputs(value: list[bytes]) -> list:
-        try:
-            return [item.decode("utf-8") for item in value]
-        except Exception as e:
-            raise ValueError(f"Failed to decode inputs into str: {e}, maybe you should override this method.")
+    def decode_inputs(value: list[bytes]) -> list[I]:
+        return [pickle.loads(item) for item in value]

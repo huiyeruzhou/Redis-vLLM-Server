@@ -5,16 +5,15 @@ from vllm import LLM, SamplingParams  # 确保 vllm 库已正确安装
 from typing_extensions import override
 from redis_util.interface import ModelInterface
 from transformers import AutoTokenizer
-import json
 from pydantic import BaseModel
+from vllm_protocol_pb2 import VLLMProtocol
 
+# class VLLMProtocol(BaseModel):
+#     texts: List[str]
+#     output_tokens: int
+#     input_tokens: int
 
-class VLLMProtocol(BaseModel):
-    texts: List[str]
-    output_tokens: int
-    input_tokens: int
-
-class VLLMModel(ModelInterface):
+class VLLMModel(ModelInterface[str, VLLMProtocol]):
     """
     VLLMModel 类根据给定的配置初始化一个 vllm.LLM 模型，并根据配置中的参数接受 prompt 和推理
     """
@@ -45,12 +44,23 @@ class VLLMModel(ModelInterface):
         print(f"Initialized VLLMModel with sampling_params {self.sampling_params}")
 
     @override
-    def process(self, batch_tasks: List[str]) -> List[str]:
+    def process(self, batch_tasks: List[str]) -> List[VLLMProtocol]:
         responses = self.llm.generate(batch_tasks, sampling_params=self.sampling_params)
-        protocols = [VLLMProtocol(texts=[o.text for o in rsp.outputs], 
+        return [VLLMProtocol(texts=[o.text for o in rsp.outputs], 
                                 output_tokens=sum(len(o.token_ids) for o in rsp.outputs), 
                                 input_tokens=len(rsp.prompt_token_ids)) for rsp in responses]
-        return [protocol.model_dump_json() for protocol in protocols]
+    @override
+    @staticmethod
+    def encode_outputs(value: list[VLLMProtocol]) -> list[bytes]:
+        return [p.SerializeToString() for p in value]
+    
+    @override
+    @staticmethod
+    def decode_outputs(value: list[bytes]) -> list[VLLMProtocol]:
+        ret = [VLLMProtocol() for _ in value]
+        for i, v in enumerate(value):
+            ret[i].ParseFromString(v)
+        return ret
 
     def parse_stop(self, stop):
         if isinstance(stop, str):
@@ -65,7 +75,6 @@ class VLLMModel(ModelInterface):
             else:
                 raise ValueError(f"Invalid eos_id type: {type(eos_id)}")
         return stop
-
 
 class DummyModel(ModelInterface):
     """

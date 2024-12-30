@@ -2,22 +2,25 @@ import redis
 import time
 import uuid
 import logging
-from typing import List
+from typing import List, Type, Generic, TypeVar
 from omegaconf import DictConfig
-from codec import response_from_byte
 
+from .codec import response_from_byte
+from .interface import ModelInterface
 
-class RedisMiddleWare:
+I = TypeVar("I")
+O = TypeVar("O")
+class RedisMiddleWare(Generic[I, O]):
     """
     RedisMiddleWare 类用于将请求发送到 Redis 流中，并根据请求的 ID 从 Redis 中获取结果。
     使用 Redis 连接池优化连接管理。
     """
 
-    def __init__(self, config: DictConfig, worker: DictConfig, name: str = ""):
+    def __init__(self, config: DictConfig, worker: DictConfig, model_cls: Type[ModelInterface[I, O]],name: str = ""):
         # 创建 Redis 连接池
         self.client_stream = config.redis.client_stream
         self.redis_pool = redis.ConnectionPool(
-            host=config.redis.host, port=config.redis.port, db=0, decode_responses=False, max_connections=10  # 设置连接池的最大连接数
+            host=config.redis.host, port=config.redis.port, db=0, decode_responses=False, max_connections=config.redis.max_connections  # 设置连接池的最大连接数
         )
         self.redis = redis.Redis(connection_pool=self.redis_pool)
         self.timeout = config.redis.timeout_seconds
@@ -26,6 +29,7 @@ class RedisMiddleWare:
         self.pending_messages: dict[str, str] = {}  # mapping task_id to message_id, used to cancel pending messages in graceful exit
         self.name = name or f"RedisMiddleware_{int(time.time())}"
         self.logger = logging.getLogger(self.name)
+        self.model_cls = model_cls
 
     def exit_handler(self, signum, frame):
         self.logger.info(f"Received signal: {signum}")
@@ -33,19 +37,20 @@ class RedisMiddleWare:
         self.redis_pool.disconnect()
         exit(0)
 
-    def process_requests(self, trajectories: List[str]) -> List[str]:
+    def process_requests(self, inputs: List[I]) -> List[O]:
         """
         处理请求，将任务发送到 Redis Stream 并等待结果。
-        :param trajectories: 任务数据列表
+        :param inputs: 任务数据列表
         :return: 任务结果列表
         """
         request_id = str(uuid.uuid4())
-        task_ids = [str(uuid.uuid4()) for _ in trajectories]
-        tasks = []
+        task_ids = [str(uuid.uuid4()) for _ in inputs]
+        encoded_inputs = self.model_cls.encode_inputs(inputs)
 
         # 构建任务数据
-        for task_id, trajectory in zip(task_ids, trajectories):
-            task = {"data": trajectory, "request_id": request_id, "task_id": task_id}
+        tasks = []
+        for task_id, encoded_input in zip(task_ids, encoded_inputs):
+            task = {"data": encoded_input, "request_id": request_id, "task_id": task_id}
             tasks.append(task)
 
         # 使用 pipeline 批量发送任务到 Redis Stream
@@ -65,7 +70,7 @@ class RedisMiddleWare:
         results = self._wait_for_results(task_ids, result_key)
         return results
 
-    def _wait_for_results(self, task_ids: List[str], result_key: str) -> List[str]:
+    def _wait_for_results(self, task_ids: List[str], result_key: str) -> List[O]:
         """
         从 Redis List 或 Stream 或 Hash 中获取结果，直到所有任务完成或超时。
         """
@@ -78,36 +83,34 @@ class RedisMiddleWare:
                 raise TimeoutError("Timed out waiting for task results")
 
             if self.client_stream == "list":
-                result = self.redis.blpop(result_key, timeout=blocktime)  # 阻塞式获取结果
+                result = self.redis.blpop(result_key, timeout=int(blocktime))  # 阻塞式获取结果
                 if result:
                     data = response_from_byte(result[1])
                     results[data.task_id] = data.result
             elif self.client_stream == "stream":
-                stream_messages = self.redis.xread({result_key: "0-0"}, count=len(task_ids), block=blocktime * 1000)
+                stream_messages = self.redis.xread({result_key: "0-0"}, count=len(task_ids), block=int(blocktime * 1000))
                 if stream_messages:
                     for stream_name, messages in stream_messages:
                         for message in messages:
                             data = message[1]
-                            results[data[b"task_id"]] = data[b"result"]
+                            results[data[b"task_id"].decode()] = data[b"result"]
             elif self.client_stream == "hash":
                 # 使用 pipeline 批量获取任务结果
-                with self.redis.pipeline() as pipe:
-                    for task_id in task_ids:
-                        pipe.hget(result_key, task_id)
-                    fetched = pipe.execute()
-
-                # 反序列化结果
-                for task_id, result in zip(task_ids, fetched):
-                    if result and task_id not in results:
+                fetched = self.redis.hgetall(result_key)
+                for task_id, result in fetched.items():
+                    task_id = task_id.decode()
+                    if task_id not in results:
                         results[task_id] = result
                         self.pending_messages.pop(task_id)
                 # 轮询等待
                 if len(results) < len(task_ids):
                     time.sleep(0.1)
+            else:
+                raise ValueError(f"Invalid client_stream value: {self.client_stream}")
 
         # 删除结果键以释放内存
         self.redis.delete(result_key)
-        return [results[task_id] for task_id in task_ids]
+        return self.model_cls.decode_outputs([results[task_id] for task_id in task_ids])
 
     def cancel_pending_messages(self):
         """

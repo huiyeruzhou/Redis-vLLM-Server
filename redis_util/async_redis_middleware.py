@@ -1,20 +1,22 @@
 import asyncio
 import uuid
 import logging
-from typing import List
+from typing import List, Type
 from omegaconf import DictConfig
 import redis.asyncio as redis
 import time
 import uuid
 import logging
 import json
+from .interface import ModelInterface
+from .codec import response_from_byte
 
 class AsyncRedisMiddleWare:
     """
     RedisMiddleWare 类用于将请求发送到 Redis 流中，并根据请求的 ID 从 Redis 中获取结果。
     使用 Redis 连接池优化连接管理。
     """
-    def __init__(self, config: DictConfig, worker: DictConfig, name: str = None):
+    def __init__(self, config: DictConfig, worker: DictConfig, model_cls: Type[ModelInterface], name: str = None):
         self.redis = None
         self.client_stream = config.redis.client_stream
         self.config = config
@@ -23,17 +25,15 @@ class AsyncRedisMiddleWare:
         self.results_prefix = worker.results_prefix
         self.pending_messages = {}
         self.name = name or f"RedisMiddleware_{int(time.time())}"
+        self.model_cls = model_cls
         self.logger = logging.getLogger(self.name)
     
     async def initialize(self):
         # 创建 Redis 连接池
-        self.redis = await redis.Redis(host=self.config.redis.host, port=self.config.redis.port, db=0, decode_responses=True)
-        # self.redis = await redis.create_redis_pool(
-        #     (self.config.redis.host, self.config.redis.port),
-        #     db=0,
-        #     encoding='utf-8',  # 自动解码返回的数据
-        #     maxsize=10         # 设置连接池的最大连接数
-        # )
+        pool = redis.ConnectionPool(
+            host=self.config.redis.host, port=self.config.redis.port, db=0, decode_responses=False, max_connections=self.config.redis.max_connections
+        )
+        self.redis = await redis.Redis(connection_pool=pool)
 
     async def exit_handler(self, signum, frame):
         self.logger.info(f"Received signal: {signum}")
@@ -42,20 +42,21 @@ class AsyncRedisMiddleWare:
         await self.redis.wait_closed()
         exit(0)
 
-    async def process_requests(self, trajectories: List[str]) -> List[str]:
+    async def process_requests(self, inputs: List[str]) -> List[str]:
         """
         处理请求，将任务发送到 Redis Stream 并等待结果。
-        :param trajectories: 任务数据列表
+        :param inputs: 任务数据列表
         :return: 任务结果列表
         """
         request_id = str(uuid.uuid4())
-        task_ids = [str(uuid.uuid4()) for _ in trajectories]
-        tasks = []
-
+        task_ids = [str(uuid.uuid4()) for _ in inputs]
+        encoded_inputs = self.model_cls.encode_inputs(inputs)
+        
         # 构建任务数据
-        for task_id, trajectory in zip(task_ids, trajectories):
+        tasks = []
+        for task_id, encoded_input in zip(task_ids, encoded_inputs):
             task = {
-                'data': trajectory,
+                'data': encoded_input,
                 'request_id': request_id, 
                 'task_id': task_id
             }
@@ -93,28 +94,31 @@ class AsyncRedisMiddleWare:
             if self.client_stream == "list":
                 result = await self.redis.blpop(result_key, timeout=int(blocktime))  # 阻塞式获取结果
                 if result:
-                    data = json.loads(result[1])
-                    results[data['task_id']] = data['result']
+                    data = response_from_byte(result[1])
+                    results[data.task_id] = data.result
             elif self.client_stream == "stream":
                 stream_messages = await self.redis.xread({result_key: '0-0'}, count=len(task_ids), block=int(blocktime * 1000))
                 if stream_messages:
                     for stream_name, messages in stream_messages:
                         for message in messages:
                             data = message[1]
-                            results[data['task_id']] = data['result']
+                            results[data[b'task_id'].decode()] = data[b'result']
             elif self.client_stream == "hash":
                 fetched = await self.redis.hgetall(result_key)
                 for task_id, result in fetched.items():
+                    task_id = task_id.decode()
                     if task_id not in results:
                         results[task_id] = result
                         self.pending_messages.pop(task_id)
                 # 异步等待
                 if len(results) < len(task_ids):
                     await asyncio.sleep(0.1)
+            else:
+                raise ValueError(f"Invalid client_stream: {self.client_stream}")
 
         # 删除结果键以释放内存
         await self.redis.delete(result_key)
-        return [results[task_id] for task_id in task_ids]
+        return self.model_cls.decode_outputs([results[task_id] for task_id in task_ids])
 
     async def cancel_pending_messages(self):
         """

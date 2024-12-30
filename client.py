@@ -3,7 +3,7 @@ import json
 from omegaconf import DictConfig, OmegaConf
 
 from redis_util.redis_middleware import RedisMiddleWare
-from model import VLLMProtocol
+from model import VLLMProtocol, VLLMModel
 
 # 定义 TreeNode 类
 class TreeNode:
@@ -43,11 +43,9 @@ def tree_search(middleware: RedisMiddleWare, root_node: TreeNode, depth: int, ev
     token_counter = Counter()
     for d in range(depth - 1):
         trajectories = [node.trajectory for node in current_level]
-        results = middleware.process_requests(trajectories)
-        results = [VLLMProtocol.model_validate_json(result) for result in results]
+        results: list[VLLMProtocol] = middleware.process_requests(trajectories)
         next_level_nodes = []
         for node, result in zip(current_level, results):
-            assert isinstance(result.texts, list), f"Expected list of children, got {result}"
             token_counter['input_tokens'] += result.input_tokens
             token_counter['output_tokens'] += result.output_tokens
             for c in result.texts:
@@ -72,7 +70,7 @@ def evaluate_fn(middleware: RedisMiddleWare, trajectory: str) -> float:
 def client_request(args: tuple[int, TreeNode]):
     global config
     client_id, root_node = args
-    middleware = RedisMiddleWare(config=config, worker=config.inference_server.worker, name=f"Client{client_id:02d}")
+    middleware = RedisMiddleWare(config=config, worker=config.inference_server.worker, model_cls=VLLMModel, name=f"Client{client_id:02d}")
     
     import signal
     signal.signal(signal.SIGINT, middleware.exit_handler)

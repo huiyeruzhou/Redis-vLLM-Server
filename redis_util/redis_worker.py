@@ -5,8 +5,8 @@ from typing import List, Dict, Type
 from omegaconf import DictConfig
 import redis
 
-from codec import response_to_byte
-from interface import ModelInterface
+from .codec import response_to_byte
+from .interface import ModelInterface
 
 
 # 定义 RedisWorker Actor
@@ -21,7 +21,7 @@ class RedisWorker:
     def __init__(self, config: DictConfig, consumer_name: str, ModelImpl: Type[ModelInterface]):
         # 创建 Redis 连接池
         self.redis_pool = redis.ConnectionPool(
-            host=config.redis.host, port=config.redis.port, db=0, decode_responses=False, max_connections=10  # 设置连接池的最大连接数
+            host=config.redis.host, port=config.redis.port, db=0, decode_responses=False, max_connections=config.redis.max_connections  # 设置连接池的最大连接数
         )
         self.redis = redis.Redis(connection_pool=self.redis_pool)
         self.client_stream = config.redis.client_stream
@@ -56,9 +56,9 @@ class RedisWorker:
         """
         data, request_ids, task_ids = [], [], []
         for task in tasks:
-            task_ids.append(task[b"task_id"])
+            task_ids.append(task[b"task_id"].decode())
             data.append(task[b"data"])
-            request_ids.append(task[b"request_id"])
+            request_ids.append(task[b"request_id"].decode())
 
         self.logger.info(f"Processing batch of {len(data)} prompts")
 
@@ -80,6 +80,8 @@ class RedisWorker:
                     pipe.xadd(result_key, {"result": result, "task_id": task_id})
                 elif self.client_stream == "hash":
                     pipe.hset(result_key, task_id, result)
+                else:
+                    raise ValueError(f"Invalid client_stream type: {self.client_stream}")
                 pipe.expire(result_key, self.expire_seconds)
             pipe.execute()
 

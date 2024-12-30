@@ -259,6 +259,22 @@ Total input tokens: 143163.0, speed 2246.91 tokens/s,
 Total output tokens: 285030.3333333333, speed 4473.48 tokens/s
 ```
 
+### 5000条数据，async
+- list
+Total time taken: 198.25s.
+Total input tokens: 18562003, speed 93628.34 tokens/s, 
+Total output tokens: 15464462, speed 78004.08 tokens/s
+
+- hash
+Total time taken: 201.71s.
+Total input tokens: 18560939, speed 92017.91 tokens/s, 
+Total output tokens: 15437547, speed 76533.34 tokens/s
+
+- stream
+Total time taken: 200.00s.
+Total input tokens: 18530732, speed 92655.40 tokens/s, 
+Total output tokens: 15339083, speed 76696.86 tokens/s
+
 ### 1000条数据，async
 
 - stream
@@ -275,22 +291,6 @@ Total output tokens: 3111921, speed 47013.71 tokens/s
 Total time taken: 69.91s.
 Total input tokens: 3725910, speed 53298.25 tokens/s, 
 Total output tokens: 3078242, speed 44033.52 tokens/s
-
-### 5000条数据，async
-- list
-Total time taken: 196.71s.
-Total input tokens: 18581520, speed 94459.87 tokens/s, 
-Total output tokens: 15332219, speed 77941.92 tokens/s
-
-- hash
-Total time taken: 209.66s.
-Total input tokens: 18545008, speed 88454.05 tokens/s, 
-Total output tokens: 15419857, speed 73548.03 tokens/s
-
-- stream
-Total time taken: 196.00s.
-Total input tokens: 18527902, speed 94532.40 tokens/s, 
-Total output tokens: 15385884, speed 78501.31 tokens/s
 
 ### 其他配置  
 

@@ -5,7 +5,7 @@ from collections import Counter
 from omegaconf import DictConfig, OmegaConf
 
 from redis_util.async_redis_middleware import AsyncRedisMiddleWare
-from model import VLLMProtocol
+from model import VLLMProtocol, VLLMModel
 
 # 定义 TreeNode 类
 class TreeNode:
@@ -44,11 +44,9 @@ async def tree_search(middleware: AsyncRedisMiddleWare, root_node: TreeNode, dep
     token_counter = Counter()
     for d in range(depth - 1):
         trajectories = [node.trajectory for node in current_level]
-        results = await middleware.process_requests(trajectories)
-        results = [VLLMProtocol.model_validate_json(result) for result in results]
+        results: list[VLLMProtocol]  = await middleware.process_requests(trajectories)
         next_level_nodes = []
         for node, result in zip(current_level, results):
-            assert isinstance(result.texts, list), f"Expected list of children, got {result}"
             token_counter['input_tokens'] += result.input_tokens
             token_counter['output_tokens'] += result.output_tokens
             for c in result.texts:
@@ -71,7 +69,7 @@ async def evaluate_fn(middleware: AsyncRedisMiddleWare, trajectory: str) -> floa
 async def client_request(args: tuple[int, TreeNode]):
     global config
     client_id, root_node = args
-    middleware = AsyncRedisMiddleWare(config=config, worker=config.inference_server.worker, name=f"Client{client_id:02d}")
+    middleware = AsyncRedisMiddleWare(config=config, worker=config.inference_server.worker, model_cls=VLLMModel, name=f"Client{client_id:02d}")
     await middleware.initialize()
 
     try:
