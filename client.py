@@ -23,7 +23,12 @@ class TreeNode:
         while current:
             nodes.append(current.value)
             current = current.parent
-        return '\n\n'.join(reversed(nodes))
+        traj = nodes[::-1]
+        prompt = traj[0]
+        for i in range(1, len(traj)):
+            prompt += traj[i] + '\n\n'
+        prompt += '\n\n'
+        return prompt
 
     def __repr__(self):
         return f"TreeNode(value={self.value}, score={self.score})"

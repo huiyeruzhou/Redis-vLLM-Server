@@ -16,7 +16,7 @@
 
 ## 性能试验
 
-在32卡节点上试验，使用async_client在5000条样本上运行宽度为5深度为3的波束搜索算法，估值函数的消耗可忽略不计，设置目标batchsize=200，吞吐量能达到**32倍单卡极限吞吐量的55%**：78501/32/4473 = 0.548，这里使用的极限吞吐量对应于**batchsize=1000**时的单卡vllm推理速度。
+在32卡节点上试验，使用async_client在5000条样本上运行宽度为5深度为3的波束搜索算法，估值函数的消耗可忽略不计，设置目标batchsize=200，吞吐量能达到**32倍单卡极限吞吐量的70%**：99401/32/4473 = 0.694，这里使用的极限吞吐量对应于**batchsize=1000**时的单卡vllm推理速度。
 
 考虑到搜索是高度碎片化的，并且redis中间件和具体的搜索算法或模型服务完全解耦，（修改redis_utils中的内容不会影响clien和server的代码），这还是相当了不起速度。
 
@@ -220,7 +220,9 @@ dataset:
 
 ### 普通ray worker
 
-这组基准测试展示了vllm自带的超线性加速效果，对于小规模的请求，vllm的速度会随着batch size的增加而增加。
+这组基准测试展示了vllm自带的超线性加速效果，对于小规模的请求，vllm的速度会随着batch size的增加而增加。其端到端吞吐量差异可以达到7～8倍，这也是项目主要的性能提升点。
+
+然而，batchsize增大后，输出长度如果特别不均衡也会导致问题：个别超长的推理将会导致同一批次的其他请求被阻塞。因此max_tokens更大时的结果可能会有所不同。
 
 ```bash
 Processed prompts: 100%|██████████| 1/1 [00:01<00:00,  1.05s/it, est. speed input: 110.51 toks/s, output: 334.38 toks/s]
@@ -259,7 +261,29 @@ Total input tokens: 143163.0, speed 2246.91 tokens/s,
 Total output tokens: 285030.3333333333, speed 4473.48 tokens/s
 ```
 
-### 5000条数据，async
+### 5000条数据，async client，output比较均匀（长度都为一句话左右）
+
+> 性能测试有波动，最终结果是三者没有本质区别
+
+- list
+Total time taken: 232.23s.
+Total input tokens: 20967829, speed 90288.88 tokens/s, 
+Total output tokens: 22971528, speed 98916.95 tokens/s
+
+- stream
+Total time taken: 237.37s.
+Total input tokens: 20952985, speed 88273.27 tokens/s, 
+Total output tokens: 22959032, speed 96724.58 tokens/s
+
+- hash
+Total time taken: 231.17s.
+Total input tokens: 20954319, speed 90643.39 tokens/s, 
+Total output tokens: 22978914, speed 99401.30 tokens/s
+
+
+
+### 5000条数据，async，包含大量output碎片（少量长度为200+token，大量仅有一个空格）
+
 - list
 Total time taken: 198.25s.
 Total input tokens: 18562003, speed 93628.34 tokens/s, 
@@ -274,6 +298,9 @@ Total output tokens: 15437547, speed 76533.34 tokens/s
 Total time taken: 200.00s.
 Total input tokens: 18530732, speed 92655.40 tokens/s, 
 Total output tokens: 15339083, speed 76696.86 tokens/s
+
+---
+> 以下perf都是包含大量碎片的结果
 
 ### 1000条数据，async
 
