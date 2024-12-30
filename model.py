@@ -3,7 +3,7 @@ from typing import List
 from omegaconf import DictConfig
 from vllm import LLM, SamplingParams  # 确保 vllm 库已正确安装
 from typing_extensions import override
-from redis_util.redis_worker import ModelInterface
+from redis_util.interface import ModelInterface
 from transformers import AutoTokenizer
 import json
 from pydantic import BaseModel
@@ -43,7 +43,7 @@ class VLLMModel(ModelInterface):
         )
         print(f"Initialized VLLMModel with model {config.llm.model}")
         print(f"Initialized VLLMModel with sampling_params {self.sampling_params}")
-    
+
     @override
     def process(self, batch_tasks: List[str]) -> List[str]:
         responses = self.llm.generate(batch_tasks, sampling_params=self.sampling_params)
@@ -51,7 +51,7 @@ class VLLMModel(ModelInterface):
                                 output_tokens=sum(len(o.token_ids) for o in rsp.outputs), 
                                 input_tokens=len(rsp.prompt_token_ids)) for rsp in responses]
         return [protocol.model_dump_json() for protocol in protocols]
-    
+
     def parse_stop(self, stop):
         if isinstance(stop, str):
             stop = [stop]
@@ -65,9 +65,9 @@ class VLLMModel(ModelInterface):
             else:
                 raise ValueError(f"Invalid eos_id type: {type(eos_id)}")
         return stop
-                
 
-class DummyModel:
+
+class DummyModel(ModelInterface):
     """
     DummyModel 类用于模拟模型的处理过程。它接受一个字符串列表作为输入，并返回一个字符串列表作为输出。
     """
@@ -79,5 +79,3 @@ class DummyModel:
         # 模拟超线性的处理速度
         time.sleep(1 * len(batch_tasks) ** 0.8)
         return [["response" + str(i) for i in range(self.n)]] * len(batch_tasks)
-
-

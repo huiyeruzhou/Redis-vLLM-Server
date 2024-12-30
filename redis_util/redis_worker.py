@@ -1,24 +1,13 @@
 import ray
 import time
-import json
 import logging
 from typing import List, Dict, Type
 from omegaconf import DictConfig
 import redis
-from abc import ABC, abstractmethod
 
+from codec import response_to_byte
+from interface import ModelInterface
 
-# 定义 ModelInterface 抽象基类
-class ModelInterface(ABC):
-    """
-    ModelInterface 类是一个抽象基类，用于定义模型接口。它定义了一个 process 方法，用于处理输入数据并返回输出结果。
-    """
-    def __init__(self, config: DictConfig):
-        pass
-
-    @abstractmethod
-    def process(self, batch_tasks: List[str]) -> List[str]:
-        pass
 
 # 定义 RedisWorker Actor
 @ray.remote(num_cpus=1, runtime_env={"pip": ["redis"]})
@@ -28,14 +17,11 @@ class RedisWorker:
     每个消费者从 Redis 队列中获取任务，并使用 ModelInterface 实现类进行处理。
     处理完成后，发送 ack 并将结果写入 Redis Hash。
     """
+
     def __init__(self, config: DictConfig, consumer_name: str, ModelImpl: Type[ModelInterface]):
         # 创建 Redis 连接池
         self.redis_pool = redis.ConnectionPool(
-            host=config.redis.host,
-            port=config.redis.port,
-            db=0,
-            decode_responses=True,  # 自动解码返回的数据为字符串
-            max_connections=10      # 设置连接池的最大连接数
+            host=config.redis.host, port=config.redis.port, db=0, decode_responses=False, max_connections=10  # 设置连接池的最大连接数
         )
         self.redis = redis.Redis(connection_pool=self.redis_pool)
         self.client_stream = config.redis.client_stream
@@ -54,12 +40,7 @@ class RedisWorker:
         创建消费者组。如果消费者组已经存在，则忽略错误。
         """
         try:
-            self.redis.xgroup_create(
-                name=self.stream_name,
-                groupname=self.group_name,
-                id='0',
-                mkstream=True
-            )
+            self.redis.xgroup_create(name=self.stream_name, groupname=self.group_name, id="0", mkstream=True)
             self.logger.info(f"Created consumer group '{self.group_name}'")
         except redis.exceptions.ResponseError as e:
             if "BUSYGROUP" in str(e):
@@ -75,18 +56,17 @@ class RedisWorker:
         """
         data, request_ids, task_ids = [], [], []
         for task in tasks:
-            task_ids.append(task['task_id'])  
-            data.append(task['data'])         
-            request_ids.append(task['request_id'])  
+            task_ids.append(task[b"task_id"])
+            data.append(task[b"data"])
+            request_ids.append(task[b"request_id"])
 
         self.logger.info(f"Processing batch of {len(data)} prompts")
 
         # 处理任务
-        results = self.model.process(data)
-        assert isinstance(results, list), (
-            f"Model.process should return a list, but got {type(results)}")
-        assert isinstance(results[0], str), (
-            f"Model.process should return a list of strings, but got {type(results[0])}")
+        results = self.model.process_bytes(data)
+        assert isinstance(results, list), f"Model.process should return a list, but got {type(results)}"
+        # assert isinstance(results[0], str), (
+        #     f"Model.process should return a list of strings, but got {type(results[0])}")
 
         # 将结果推送到 Redis List 或 Stream 或 Hash 中
         with self.redis.pipeline() as pipe:
@@ -94,10 +74,7 @@ class RedisWorker:
                 result_key = self.results_prefix + request_id
                 # 使用 Redis List
                 if self.client_stream == "list":
-                    pipe.rpush(result_key, json.dumps({
-                        'task_id': task_id,
-                        'result': result
-                    }))
+                    pipe.rpush(result_key, response_to_byte(task_id=task_id, result=result))
                 # 或者使用 Redis Stream
                 elif self.client_stream == "stream":
                     pipe.xadd(result_key, {"result": result, "task_id": task_id})
@@ -106,8 +83,7 @@ class RedisWorker:
                 pipe.expire(result_key, self.expire_seconds)
             pipe.execute()
 
-        self.logger.info(f"Completed batch") 
-        
+        self.logger.info(f"Completed batch")
 
     def run(self):
         """
@@ -120,9 +96,9 @@ class RedisWorker:
                 messages = self.redis.xreadgroup(
                     groupname=self.group_name,
                     consumername=self.consumer_name,
-                    streams={self.stream_name: '>'},
+                    streams={self.stream_name: ">"},
                     count=self.batch_size,
-                    block=self.poll_interval_milis  # 毫秒
+                    block=self.poll_interval_milis,  # 毫秒
                 )
 
                 if messages:
@@ -140,6 +116,7 @@ class RedisWorker:
             except Exception as e:
                 self.logger.error(f"Encountered error - {e}")
                 import traceback
+
                 self.logger.error(f"{traceback.format_exc()}")
                 if "NOGROUP" in str(e):
                     self.logger.warning(f"Consumer group '{self.group_name}' does not exist")
@@ -154,9 +131,6 @@ class RedisWorker:
         self.logger.info(f"Redis connection pool closed.")
 
 
-
-
-
 class RedisServer:
     def __init__(self, cfg: DictConfig) -> None:
         self.config = cfg
@@ -167,7 +141,6 @@ class RedisServer:
         # 删除这个worker此前产出的的结果
         for key in self.redis_client.scan_iter(f"{cfg.worker.results_prefix}*"):
             self.redis_client.delete(key)
-        
 
     def exit_handler(self, signum, frame):
         try:
@@ -184,6 +157,7 @@ class RedisServer:
         :param group_pattern: 可选的消费者组模，用于过滤要删除的组，通配符匹配
         """
         import fnmatch
+
         try:
             groups = self.redis_client.xinfo_groups(stream_name)
         except redis.exceptions.ResponseError as e:
@@ -194,7 +168,7 @@ class RedisServer:
             return
 
         for group in groups:
-            group_name = group['name'].decode('utf-8')
+            group_name = group["name"].decode("utf-8")
             if group_pattern and fnmatch.fnmatch(group_name, group_pattern):
                 try:
                     self.redis_client.xgroup_destroy(stream_name, group_name)
@@ -202,7 +176,7 @@ class RedisServer:
                 except redis.exceptions.ResponseError as e:
                     logging.error(f"Failed to delete consumer group '{group_name}': {e}")
 
-    def run_workers(self, num_workers, ModelImpl:Type[ModelInterface]):
+    def run_workers(self, num_workers, ModelImpl: Type[ModelInterface]):
         """
         启动多个 Worker 来处理 Redis 队列中的任务。这个方法不会返回。
         :param num_workers: 要启动的 Worker 数量
@@ -214,15 +188,9 @@ class RedisServer:
             consumer_name = f"{consumer_uid}_{i}"
             worker = RedisWorker.options(
                 num_gpus=self.config.llm.tensor_parallel_size,
-            ).remote(
-                config=self.config,
-                consumer_name=consumer_name,
-                ModelImpl=ModelImpl
-            )
+            ).remote(config=self.config, consumer_name=consumer_name, ModelImpl=ModelImpl)
             workers.append(worker)
         # 启动 Worker 的 run 方法作为后台任务
-        refs = [
-            worker.run.remote() for worker in workers
-        ]
+        refs = [worker.run.remote() for worker in workers]
         print(f"Started {num_workers} worker.")
         ray.get(refs)
