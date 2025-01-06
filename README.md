@@ -1,5 +1,13 @@
 # Redis-vLLM-Server
 
+## 归档说明
+
+随着VLLM推理技术的进步，tokenizer和解析请求参数的时间已经不再阻塞CPU，与此同时，VLLM内部使用zeromq实现了请求和生成的解耦，因此，相关需求可以通过ray serve配合vllm的AsyncLLMEngine实现
+我找到了一个非常好的仓库：https://github.com/asprenger/ray_vllm_inference，我fork了一个版本以支持pydantic_v2和一些其他兼容性问题，并且对http客户端同样进行了调优。改进后的仓库位于：https://github.com/huiyeruzhou/ray_vllm_inference，
+它使用和本项目相同的配置处理请求时可以达到巅峰吞吐量的80%，并且可以通过ray进行日志管理，优雅退出，负载均衡等操作。
+
+拥抱新时代的技术！
+
 ## 项目简介
 
 这个项目利用 redis 实现了客户端和服务端解耦的 llm 服务，并且在服务端进行了请求批量化以最大程度利用 vllm 的超线性加速。
